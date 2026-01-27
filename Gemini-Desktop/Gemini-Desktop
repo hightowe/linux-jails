@@ -1,0 +1,83 @@
+#!/bin/bash
+
+#####################################################################
+# Script to launch Gemini-Desktop inside a firejail and with a
+# Google-only network filter. Limiting DNS to GOOGLE_DNS may be
+# overkill, but it was easy to do and prevents the app from seeing
+# any LAN DNS items. Not allowing access to GitHub IP addresses
+# means that "Check for Updates" does not work.
+#
+# Gemini-Desktop is from https://github.com/bwendell/gemini-desktop
+# I grabbed it on 01/26/2026 after I got nervous about gemini-desk.
+#####################################################################
+
+# Config
+#APP_EXE="$HOME/bin/Gemini-Desktop-0.4.1-x86_64.AppImage"
+APP_EXE="/usr/bin/gemini-desktop"
+JAIL_NAME="gemini-desktop-$(date +%Y%m%d-%H%M%S)"
+JAIL_DIR="$HOME/jails/gemini-desk"
+RULES_FILE="$JAIL_DIR/google.rules"
+GOOGLE_DNS="8.8.8.8"
+ETH_IF=$(ip route get "$GOOGLE_DNS" | grep -oP 'dev \K\S+')
+
+# Fetch Google's latest IP ranges (JSON to list of CIDRs)
+echo "Fetching Google IP ranges..."
+GOOGLE_IPS=$(curl -s https://www.gstatic.com/ipranges/goog.json | jq -r '.prefixes[].ipv4Prefix | select(. != null)')
+
+# Create the Netfilter Rules file
+# We use the standard iptables-restore format that Firejail expects
+cat <<EOF > "$RULES_FILE"
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT DROP [0:0]
+
+# Allow loopback for internal app communication
+-A INPUT -i lo -j ACCEPT
+-A OUTPUT -o lo -j ACCEPT
+
+# Allow RELATED,ESTABLISHED incoming traffic
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# Allow DNS (Google DNS 8.8.8.8)
+-A OUTPUT -p udp -d $GOOGLE_DNS -j ACCEPT
+-A OUTPUT -p tcp -d $GOOGLE_DNS -j ACCEPT
+EOF
+# Append each Google IP range as an allowed OUTPUT destination
+for ip in $GOOGLE_IPS; do
+    echo "-A OUTPUT -d $ip -j ACCEPT" >> "$RULES_FILE"
+done
+echo '-A OUTPUT -j LOG --log-prefix "firejail-deny: "' >> "$RULES_FILE" # Log any OUTPUT denies
+echo -e "COMMIT\n" >> "$RULES_FILE" # The "\n" here is vital!!!
+
+# Give the user some helpful tips
+echo
+echo "To see firejails: firejail --list"
+echo "To see netfilter: firejail --netfilter.print=<pid|name>"
+echo
+
+# Auto-detect if the binary that we were given is an AppImage and
+# set APP_IMAGE_FLAG accordingly.
+APP_IMAGE_FLAG=""
+APPIMG_SIG=$(od -j 8 -N 3 -An -t x1 "$APP_EXE" | tr -d ' ')
+if [ "$APPIMG_SIG" == "414902" ]; then
+  echo "Binary is a Type 2 AppImage (APPIMG_SIG: $APPIMG_SIG)"
+  APP_IMAGE_FLAG="--appimage"
+fi
+
+# Launch Firejail
+#hightowe@eden ~/bin $ firejail --debug --name=gemini-desktop --noprofile --net=eno1 --dns=8.8.8.8 --netfilter=/home/hightowe/gemini-desk-jail/google.rules --appimage ./Gemini-Desktop-0.4.1-x86_64.AppImage
+echo "Launching Gemini Desktop with network filtering on $ETH_IF..."
+# What is being done here is a bit tricky. Setting HOME="$JAIL_DIR"
+# gets GeminiDesktop to write it's config to ~/gemini-desk-jail/.config
+# while allowing "$HOME/Downloads" to be shared via the whitelist.
+HOME="$JAIL_DIR" firejail --name="$JAIL_NAME" \
+         --whitelist="$HOME/Downloads" \
+         --whitelist="$JAIL_DIR" \
+         --noprofile \
+         --net="$ETH_IF" \
+         --dns="$GOOGLE_DNS" \
+         --netfilter="$RULES_FILE" \
+         $APP_IMAGE_FLAG "$APP_EXE" \
+         --no-sandbox
+
